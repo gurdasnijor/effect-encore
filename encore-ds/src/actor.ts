@@ -14,8 +14,8 @@ import {
 } from "./actor-state.ts";
 import type { EncoreConfig } from "./config.ts";
 import { type InboxMessage, enqueue } from "./mailbox.ts";
-import { peekReply, waitForReply, watchReply } from "./replies.ts";
-import { type ExecId, type PeekResult, isFailure, isSuccess } from "./receipt.ts";
+import { peekReply, waitForReply, waitForReplyMatching, watchReply } from "./replies.ts";
+import { type ExecId, type PeekResult, isFailure, isSuccess, parseExecId } from "./receipt.ts";
 
 // Re-exported under the `Actor` namespace so entity handlers can publish live
 // state exactly as effect-encore: `Actor.registerState({ get, watch })`.
@@ -42,9 +42,34 @@ type PayloadOf<D> = D extends OperationDef<infer P, infer _S, infer _E> ? P : ne
 type SuccessOf<D> = D extends OperationDef<infer _P, infer S, infer _E> ? S : never;
 type ErrorOf<D> = D extends OperationDef<infer _P, infer _S, infer E> ? E : never;
 
-// ── Per-operation handle (payload-only methods) ──────────────────────────
+// ── Operation value — the README's `Order.Place({...})` constructor ────────
 
-export interface OperationHandle<P, S, E> {
+declare const OpValueBrand: unique symbol;
+
+/** A built-but-undispatched operation: `{ _tag, payload }`. Produced by calling
+ *  an operation handle (`Order.Place({...})`) or `Op.make(payload)`, and
+ *  consumed by the actor-level `execute`/`send`. The phantom brand carries the
+ *  success/error types so the unified call site stays typed. */
+export interface OperationValue<S = unknown, E = unknown> {
+  readonly _tag: string;
+  readonly payload: unknown;
+  readonly [OpValueBrand]?: { readonly success: S; readonly error: E };
+}
+
+/** Options for `waitFor`. */
+export interface WaitForOptions<S = unknown, E = unknown> {
+  /** Resolve on the first `PeekResult` matching this predicate. Defaults to the
+   *  first terminal result. (The drain is push-based, so unlike the cluster
+   *  original no polling `schedule` is needed.) */
+  readonly filter?: (result: PeekResult<S, E>) => boolean;
+}
+
+// ── Per-operation handle (callable; payload-only methods) ──────────────────
+
+export type OperationHandle<P, S, E> = {
+  /** Build an `OperationValue` without dispatching — the README's
+   *  `Order.Place({...})` constructor. */
+  (payload: P): OperationValue<S, E>;
   /** Pure, deterministic ExecId for this dispatch. */
   readonly executionId: (payload: P) => ExecId<S, E>;
   /** Producer-only: enqueue (idempotent) and return the ExecId. No handler
@@ -55,18 +80,20 @@ export interface OperationHandle<P, S, E> {
   readonly execute: (payload: P) => Effect.Effect<S, E | DurableTableError, EncoreConfig>;
   /** Non-blocking status. */
   readonly peek: (payload: P) => Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig>;
-  /** Block until terminal, then return the PeekResult. */
+  /** Block until the reply matches (default: first terminal), then return it. */
   readonly waitFor: (
     payload: P,
+    options?: WaitForOptions<S, E>,
   ) => Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig>;
   /** Live status: replays the current outcome (if any) then tails until a
    *  terminal `PeekResult` arrives, at which point the stream completes. */
   readonly watch: (
     payload: P,
   ) => Stream.Stream<PeekResult<S, E>, DurableTableError, EncoreConfig>;
-  /** Escape hatch: build the inbox message without dispatching. */
-  readonly make: (payload: P) => InboxMessage;
-}
+  /** Escape hatch: build the `OperationValue` without dispatching (same as
+   *  calling the handle). */
+  readonly make: (payload: P) => OperationValue<S, E>;
+};
 
 const makeHandle = <P, S, E>(
   actorType: string,
@@ -78,7 +105,11 @@ const makeHandle = <P, S, E>(
     return { execId: deriveExecId<S, E>(tag, resolved), entityId: resolved.entityId };
   };
 
-  const make = (payload: P): InboxMessage => {
+  /** Public, undispatched value — the README's `Order.Place({...})`. */
+  const make = (payload: P): OperationValue<S, E> => ({ _tag: tag, payload });
+
+  /** Internal: the durable inbox row for a dispatch (PK = ExecId). */
+  const toInbox = (payload: P): InboxMessage => {
     const { execId } = idOf(payload);
     return { msgId: execId, tag, payload: JSON.stringify(payload) };
   };
@@ -88,7 +119,7 @@ const makeHandle = <P, S, E>(
   const send = (payload: P): Effect.Effect<ExecId<S, E>, DurableTableError, EncoreConfig> => {
     const { execId, entityId } = idOf(payload);
     return withActor(actorType, entityId, (table) =>
-      Effect.as(enqueue(table, make(payload)), execId),
+      Effect.as(enqueue(table, toInbox(payload)), execId),
     );
   };
 
@@ -103,12 +134,20 @@ const makeHandle = <P, S, E>(
 
   const waitFor = (
     payload: P,
+    options?: WaitForOptions<S, E>,
   ): Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig> => {
     const { execId, entityId } = idOf(payload);
+    const filter = options?.filter as ((r: PeekResult) => boolean) | undefined;
     return withActor(
       actorType,
       entityId,
-      (table) => waitForReply(table, execId) as Effect.Effect<PeekResult<S, E>, DurableTableError>,
+      (table) =>
+        (filter === undefined
+          ? waitForReply(table, execId)
+          : waitForReplyMatching(table, execId, filter)) as Effect.Effect<
+          PeekResult<S, E>,
+          DurableTableError
+        >,
     );
   };
 
@@ -116,7 +155,7 @@ const makeHandle = <P, S, E>(
     const { execId, entityId } = idOf(payload);
     return withActor(actorType, entityId, (table) =>
       Effect.gen(function* () {
-        yield* enqueue(table, make(payload));
+        yield* enqueue(table, toInbox(payload));
         const result = (yield* waitForReply(table, execId)) as PeekResult<S, E>;
         if (isSuccess(result)) return result.value;
         if (isFailure(result)) return yield* Effect.fail(result.error);
@@ -138,7 +177,18 @@ const makeHandle = <P, S, E>(
     );
   };
 
-  return { executionId, send, execute, peek, waitFor, watch, make };
+  // The handle is callable (`Op(payload)` builds an OperationValue) with the
+  // payload-only methods attached.
+  const callable = (payload: P): OperationValue<S, E> => make(payload);
+  return Object.assign(callable, {
+    executionId,
+    send,
+    execute,
+    peek,
+    waitFor,
+    watch,
+    make,
+  }) as OperationHandle<P, S, E>;
 };
 
 // ── Entity actor ─────────────────────────────────────────────────────────
@@ -165,6 +215,34 @@ export type EntityActor<Defs extends Record<string, AnyOperationDef>> = {
     ErrorOf<Defs[Tag]>
   >;
 } & {
+  // ── Unified call site — dispatch a built OperationValue ──────────────────
+  /** Enqueue then await the terminal outcome of a built operation
+   *  (`Order.execute(Order.Place({...}))`). */
+  readonly execute: <S, E>(
+    op: OperationValue<S, E>,
+  ) => Effect.Effect<S, E | DurableTableError, EncoreConfig>;
+  /** Fire-and-forget dispatch of a built operation; returns its ExecId. */
+  readonly send: <S, E>(
+    op: OperationValue<S, E>,
+  ) => Effect.Effect<ExecId<S, E>, DurableTableError, EncoreConfig>;
+  /** Pure ExecId for a built operation (entityId comes from its `id` fn). */
+  readonly executionId: <S, E>(op: OperationValue<S, E>) => ExecId<S, E>;
+
+  // ── Status tracking, keyed by opaque ExecId ─────────────────────────────
+  /** One-shot status of an execution. */
+  readonly peek: <S, E>(
+    execId: ExecId<S, E>,
+  ) => Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig>;
+  /** Live status stream that completes on the terminal outcome. */
+  readonly watch: <S, E>(
+    execId: ExecId<S, E>,
+  ) => Stream.Stream<PeekResult<S, E>, DurableTableError, EncoreConfig>;
+  /** Block until the reply matches (default: first terminal). */
+  readonly waitFor: <S, E>(
+    execId: ExecId<S, E>,
+    options?: WaitForOptions<S, E>,
+  ) => Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig>;
+
   /**
    * Host this entity: claim the drain for `entityId` and run the behavior until
    * interrupted. Activation-based — fork it, interrupt to release.
@@ -250,6 +328,67 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
 
   const address = (entityId: string) => ({ entityType: name, entityId });
 
+  // ── Unified call site: dispatch a built OperationValue by delegating to its
+  // operation handle (which carries the `id` fn → entityId + ExecId). ────────
+  const handleFor = (op: OperationValue): OperationHandle<unknown, unknown, unknown> => {
+    const handle = handles[op._tag];
+    if (handle === undefined) {
+      return Effect.die(new Error(`encore-ds: unknown operation '${op._tag}' on ${name}`)) as never;
+    }
+    return handle;
+  };
+  const executeOp = <S, E>(
+    op: OperationValue<S, E>,
+  ): Effect.Effect<S, E | DurableTableError, EncoreConfig> =>
+    handleFor(op).execute(op.payload) as Effect.Effect<S, E | DurableTableError, EncoreConfig>;
+  const sendOp = <S, E>(
+    op: OperationValue<S, E>,
+  ): Effect.Effect<ExecId<S, E>, DurableTableError, EncoreConfig> =>
+    handleFor(op).send(op.payload) as Effect.Effect<ExecId<S, E>, DurableTableError, EncoreConfig>;
+  const executionIdOp = <S, E>(op: OperationValue<S, E>): ExecId<S, E> =>
+    handleFor(op).executionId(op.payload) as ExecId<S, E>;
+
+  // ── Status tracking by ExecId: parse the entityId out of the ExecId and read
+  // that actor's replies stream directly (no payload needed). ────────────────
+  const peekById = <S, E>(
+    execId: ExecId<S, E>,
+  ): Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig> => {
+    const { entityId } = parseExecId(execId);
+    return withActor(
+      name,
+      entityId,
+      (table) => peekReply(table, execId) as Effect.Effect<PeekResult<S, E>, DurableTableError>,
+    );
+  };
+  const watchById = <S, E>(
+    execId: ExecId<S, E>,
+  ): Stream.Stream<PeekResult<S, E>, DurableTableError, EncoreConfig> => {
+    const { entityId } = parseExecId(execId);
+    return withActorStream(
+      name,
+      entityId,
+      (table) => watchReply(table, execId) as Stream.Stream<PeekResult<S, E>, DurableTableError>,
+    );
+  };
+  const waitForById = <S, E>(
+    execId: ExecId<S, E>,
+    options?: WaitForOptions<S, E>,
+  ): Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig> => {
+    const { entityId } = parseExecId(execId);
+    const filter = options?.filter as ((r: PeekResult) => boolean) | undefined;
+    return withActor(
+      name,
+      entityId,
+      (table) =>
+        (filter === undefined
+          ? waitForReply(table, execId)
+          : waitForReplyMatching(table, execId, filter)) as Effect.Effect<
+          PeekResult<S, E>,
+          DurableTableError
+        >,
+    );
+  };
+
   const getStateFn = <State, StateError = never, MError = never, MR = never>(
     entityId: string,
     options?: ActorStateOptions<MError, MR>,
@@ -283,6 +422,12 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
   return {
     name,
     ...handles,
+    execute: executeOp,
+    send: sendOp,
+    executionId: executionIdOp,
+    peek: peekById,
+    watch: watchById,
+    waitFor: waitForById,
     activate: activateEntity,
     getState: getStateFn,
     watchState: watchStateFn,

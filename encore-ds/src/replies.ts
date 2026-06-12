@@ -32,6 +32,25 @@ export const waitForReply = (
   );
 
 /**
+ * Block until the reply for `execId` satisfies `predicate`, then return it.
+ * The reply row is written exactly once (terminal), so this resolves on that
+ * reply when it matches; if it never matches, the subscription tails until the
+ * scope closes (caller-bounded). Backs `waitFor(execId, { filter })`.
+ */
+export const waitForReplyMatching = (
+  table: ActorTableService,
+  execId: ExecId,
+  predicate: (result: PeekResult) => boolean,
+): Effect.Effect<PeekResult, DurableTableError> =>
+  table.replies.rows().pipe(
+    Stream.filter((row) => row.execId === execId),
+    Stream.map((row) => decodeOutcome(row.exit)),
+    Stream.filter(predicate),
+    Stream.runHead,
+    Effect.map((opt) => Option.getOrElse(opt, () => Pending)),
+  );
+
+/**
  * Stream the completion outcome for `execId`. Built from the same
  * replay-then-tail `rows()` feed as `waitForReply`: the reply replays
  * immediately if already present, otherwise the subscription tails until it

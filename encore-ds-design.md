@@ -451,3 +451,36 @@ plus one hosted end-to-end through `activate` + `getState`. The seam is the
 upgrade path: if upstream's `Machine` stabilises in a pinnable release,
 `behavior()` is where a vendored/real `Machine` would be wrapped, leaving the
 flat reimplementation as the fallback.
+
+---
+
+## 12. README-surface fidelity — unified call site + ExecId status API
+
+The published `effect-encore` README leads with two shapes the per-op slice
+hadn't ported. Both are now wired (`test/unified-call-site.test.ts`):
+
+- **Callable operation constructors.** `Order.Place({...})` returns an
+  `OperationValue` `{ _tag, payload }` (so does `Op.make(payload)`). Operation
+  handles are callable function-objects: `Order.Place(p)` builds the value,
+  `Order.Place.execute(p)` still dispatches.
+- **Unified actor-level dispatch.** `Order.execute(op)` / `Order.send(op)` /
+  `Order.executionId(op)` take a built `OperationValue` and delegate to the
+  owning handle (which carries the `id` fn).
+- **Status by opaque `ExecId`.** `Order.peek(execId)` / `Order.watch(execId)` /
+  `Order.waitFor(execId, { filter })` read status without a payload. The ExecId
+  is `entityId\0tag\0primaryKey`, so the actor parses the entityId back out and
+  reads exactly that actor's replies stream — status tracking is decoupled from
+  dispatch, as in the README.
+
+Two deliberate divergences from the README, both forced by the backbone:
+
+- **No `ref(entityId)`.** The README routes via `Order.ref("ord-1").execute(op)`,
+  separating the routing entityId from the op's dedup `id`. encore-ds already
+  folded both into one `id` fn (string → `entityId === primaryKey`; object →
+  `{ entityId, primaryKey }`, per CLAUDE.md), so entityId comes from
+  `id(payload)` and a separate `ref` would be a redundant second source of
+  truth. The unified call site is therefore `Order.execute(op)`, not
+  `Order.ref(id).execute(op)`.
+- **No `schedule` on `waitFor`.** The cluster original polls, so it takes a
+  `Schedule`. The drain is push-based (replay-then-tail), so `waitFor` blocks on
+  the reply feed directly; only the `filter` predicate is meaningful.
