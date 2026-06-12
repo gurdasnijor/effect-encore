@@ -5,6 +5,14 @@
 export * as Actor from "./actor.ts";
 export { EncoreConfig, type EncoreConfigShape } from "./config.ts";
 export {
+  type ActorAddress,
+  type ActorStateHandle,
+  ActorStateRegistry,
+  type ActorStateRegistryShape,
+  ActorStateUnavailable,
+  CurrentActorAddress,
+} from "./actor-state.ts";
+export {
   type ExecId,
   makeExecId,
   parseExecId,

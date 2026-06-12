@@ -344,15 +344,15 @@ src/
   activation.ts   owner-key claim, drain loop, epoch takeover
   replies.ts      Replies table + waitForStoredRow
   driver.ts       step fiber ‖ cancel/signal watcher fiber
-  state.ts        durable state row + rows() watch   (see decision below)
+  actor-state.ts  live entity-state registry           (ported ~verbatim — see decision below)
   workflow.ts     DurableStreamsWorkflowEngine layer + signal plumbing
   step.ts         ← port ~verbatim (targets upstream @effect/workflow already)
   actor.ts        fromEntity/fromWorkflow/toLayer/toTestLayer   ← ported surface
   index.ts
 ```
 
-New code: `mailbox / activation / replies / driver / state`. Ported: `actor /
-receipt / step`.
+New code: `mailbox / activation / replies / driver`. Ported: `actor /
+receipt / step / actor-state`.
 
 ---
 
@@ -371,11 +371,23 @@ spec:
 
 ---
 
-## Two decisions I want your call on
+## Decisions (resolved)
 
-- **Entity state.** encore's is live-heap-only (`Ref<Map>`, lost on restart,
-  `actor-state.ts:42`). On DurableTable I'd make it a **durable, projectable row** —
-  strictly more capable (cross-process, survives restart). Sketched that way in
-  `state.ts` above. Say the word if you'd rather keep exact live-heap parity.
-- **Where it lives.** New `packages/encore-ds` in this repo (easy to diff surface
-  against the cluster version) vs. standalone vs. inside firegrid. Leaning in-repo.
+- **Entity state — live-heap parity (resolved).** Kept exact fidelity with
+  effect-encore's live-heap protocol: `encore-ds/src/actor-state.ts` ports
+  `ActorStateRegistry` / `registerState` / `stateOf` / `watchStateOf` /
+  `waitForStateOf` / `listStateEntityIds` ~verbatim, substituting only cluster's
+  `EntityAddress`/`CurrentAddress` for an encore-ds `(entityType, entityId)` pair
+  + `CurrentActorAddress` service (provided by `activate` around an owned drain).
+  An entity behavior publishes a `SubscriptionRef` handle via
+  `Actor.registerState({ get, watch })`; observers in the same process read it
+  through `getState`/`watchState`/`waitForState`. Like upstream, it is a live
+  heap protocol — a cross-process reader sees `ActorStateUnavailable`, and the
+  handle is deregistered when the activation scope closes. The durable-row
+  variant remains available as a strictly-more-capable, deliberately-separate
+  path if cross-process/restart-surviving state is later wanted.
+  Conformance: `test/agent-session.test.ts` drives an AI-agent session state
+  machine (tool/permission-gated transitions) over an event stream and asserts
+  through `getState`/`watchState`/`waitForState`/`listStateEntityIds`.
+- **Where it lives (resolved).** In-repo under `encore-ds/`, to keep the surface
+  diffable against the cluster version.

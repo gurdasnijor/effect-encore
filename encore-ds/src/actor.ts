@@ -1,12 +1,26 @@
-import { Effect, type Schema, type Stream } from "effect";
+import { Effect, type Schema, type Scope, Stream } from "effect";
 import type { DurableTableError } from "../vendor/durable-operators/index.ts";
-import { type Handlers, activate } from "./activation.ts";
+import { type Behavior, activate } from "./activation.ts";
 import { type EntityIdReturn, deriveExecId, resolveId } from "./addressing.ts";
 import { type ActorTableService, withActor, withActorStream } from "./actor-table.ts";
+import {
+  type ActorStateRegistry,
+  type ActorStateUnavailable,
+  CurrentActorAddress,
+  listStateEntityIds,
+  stateOf,
+  waitForStateOf,
+  watchStateOf,
+} from "./actor-state.ts";
 import type { EncoreConfig } from "./config.ts";
 import { type InboxMessage, enqueue } from "./mailbox.ts";
 import { peekReply, waitForReply, watchReply } from "./replies.ts";
 import { type ExecId, type PeekResult, isFailure, isSuccess } from "./receipt.ts";
+
+// Re-exported under the `Actor` namespace so entity handlers can publish live
+// state exactly as effect-encore: `Actor.registerState({ get, watch })`.
+export { registerState } from "./actor-state.ts";
+export type { ActorStateHandle } from "./actor-state.ts";
 
 // ── Operation definition ─────────────────────────────────────────────────
 
@@ -129,6 +143,19 @@ const makeHandle = <P, S, E>(
 
 // ── Entity actor ─────────────────────────────────────────────────────────
 
+/** The per-operation handlers an `activate` hosts, keyed by tag. */
+export type EntityHandlers<Defs extends Record<string, AnyOperationDef>, R> = {
+  readonly [Tag in keyof Defs & string]?: (
+    payload: PayloadOf<Defs[Tag]>,
+  ) => Effect.Effect<SuccessOf<Defs[Tag]>, ErrorOf<Defs[Tag]>, R>;
+};
+
+/** Options for the state reads — `materialize` runs first (e.g. a durable
+ *  hydration) before the live handle is read, mirroring effect-encore. */
+export interface ActorStateOptions<MError = never, MR = never> {
+  readonly materialize?: Effect.Effect<unknown, MError, MR>;
+}
+
 export type EntityActor<Defs extends Record<string, AnyOperationDef>> = {
   readonly name: string;
 } & {
@@ -139,18 +166,61 @@ export type EntityActor<Defs extends Record<string, AnyOperationDef>> = {
   >;
 } & {
   /**
-   * Host this entity: claim the drain for `entityId` and run handlers until
+   * Host this entity: claim the drain for `entityId` and run the behavior until
    * interrupted. Activation-based — fork it, interrupt to release.
+   *
+   * The behavior is either a ready handlers map or an Effect that builds one
+   * once per owned activation. The Effect form runs with `CurrentActorAddress`
+   * in scope, so a handler can create per-entity state and publish it via
+   * `Actor.registerState` for `getState`/`watchState` observers.
    */
   readonly activate: <R>(
     entityId: string,
-    handlers: {
-      readonly [Tag in keyof Defs & string]?: (
-        payload: PayloadOf<Defs[Tag]>,
-      ) => Effect.Effect<SuccessOf<Defs[Tag]>, ErrorOf<Defs[Tag]>, R>;
-    },
+    behavior:
+      | EntityHandlers<Defs, R>
+      | Effect.Effect<EntityHandlers<Defs, R>, never, R>,
     options?: { readonly workerId?: string; readonly epoch?: number },
-  ) => Effect.Effect<void, DurableTableError, R | EncoreConfig>;
+  ) => Effect.Effect<
+    void,
+    DurableTableError,
+    Exclude<R, Scope.Scope | CurrentActorAddress> | EncoreConfig
+  >;
+
+  /** Read the live state handle registered by the entity's active drain (this
+   *  process). Fails `ActorStateUnavailable` if no drain has registered state. */
+  readonly getState: <State, StateError = never, MError = never, MR = never>(
+    entityId: string,
+    options?: ActorStateOptions<MError, MR>,
+  ) => Effect.Effect<
+    State,
+    StateError | MError | ActorStateUnavailable,
+    ActorStateRegistry | MR
+  >;
+  /** Stream the registered state changes for `entityId`. */
+  readonly watchState: <State, StateError = never, MError = never, MR = never>(
+    entityId: string,
+    options?: ActorStateOptions<MError, MR>,
+  ) => Stream.Stream<
+    State,
+    StateError | MError | ActorStateUnavailable,
+    ActorStateRegistry | MR
+  >;
+  /** Block until the registered state satisfies `predicate`, then return it. */
+  readonly waitForState: <State, StateError = never, MError = never, MR = never>(
+    entityId: string,
+    predicate: (state: State) => boolean,
+    options?: ActorStateOptions<MError, MR>,
+  ) => Effect.Effect<
+    State,
+    StateError | MError | ActorStateUnavailable,
+    ActorStateRegistry | MR
+  >;
+  /** Entity ids with currently-registered state handles in this process. */
+  readonly listStateEntityIds: () => Effect.Effect<
+    ReadonlyArray<string>,
+    never,
+    ActorStateRegistry
+  >;
 };
 
 export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
@@ -164,16 +234,56 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
 
   const activateEntity = <R>(
     entityId: string,
-    handlers: Handlers<R>,
+    behavior: Behavior<R>,
     options?: { readonly workerId?: string; readonly epoch?: number },
-  ): Effect.Effect<void, DurableTableError, R | EncoreConfig> =>
+  ): Effect.Effect<void, DurableTableError, Exclude<R, Scope.Scope | CurrentActorAddress> | EncoreConfig> =>
     withActor(name, entityId, (table: ActorTableService) =>
-      activate(table, options?.workerId ?? "worker", handlers, { epoch: options?.epoch ?? 0 }),
+      Effect.provideService(
+        activate(table, options?.workerId ?? "worker", behavior, { epoch: options?.epoch ?? 0 }),
+        CurrentActorAddress,
+        { entityType: name, entityId },
+      ),
+    ) as Effect.Effect<void, DurableTableError, Exclude<R, Scope.Scope | CurrentActorAddress> | EncoreConfig>;
+
+  const address = (entityId: string) => ({ entityType: name, entityId });
+
+  const getStateFn = <State, StateError = never, MError = never, MR = never>(
+    entityId: string,
+    options?: ActorStateOptions<MError, MR>,
+  ): Effect.Effect<State, StateError | MError | ActorStateUnavailable, ActorStateRegistry | MR> =>
+    Effect.gen(function* () {
+      if (options?.materialize !== undefined) yield* options.materialize;
+      return yield* stateOf<State, StateError, never>(address(entityId));
+    });
+
+  const watchStateFn = <State, StateError = never, MError = never, MR = never>(
+    entityId: string,
+    options?: ActorStateOptions<MError, MR>,
+  ): Stream.Stream<State, StateError | MError | ActorStateUnavailable, ActorStateRegistry | MR> =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        if (options?.materialize !== undefined) yield* options.materialize;
+        return watchStateOf<State, StateError, never>(address(entityId));
+      }),
     );
+
+  const waitForStateFn = <State, StateError = never, MError = never, MR = never>(
+    entityId: string,
+    predicate: (state: State) => boolean,
+    options?: ActorStateOptions<MError, MR>,
+  ): Effect.Effect<State, StateError | MError | ActorStateUnavailable, ActorStateRegistry | MR> =>
+    Effect.gen(function* () {
+      if (options?.materialize !== undefined) yield* options.materialize;
+      return yield* waitForStateOf<State, StateError, never>(address(entityId), predicate);
+    });
 
   return {
     name,
     ...handles,
     activate: activateEntity,
+    getState: getStateFn,
+    watchState: watchStateFn,
+    waitForState: waitForStateFn,
+    listStateEntityIds: () => listStateEntityIds(name),
   } as unknown as EntityActor<Defs>;
 };
