@@ -13,6 +13,7 @@ import {
   watchStateOf,
 } from "./actor-state.ts";
 import type { EncoreConfig } from "./config.ts";
+import { ActorKindId } from "./kind.ts";
 import { type InboxMessage, enqueue } from "./mailbox.ts";
 import { peekReply, waitForReply, waitForReplyMatching, watchReply } from "./replies.ts";
 import { type ExecId, type PeekResult, isFailure, isSuccess, parseExecId } from "./receipt.ts";
@@ -21,6 +22,27 @@ import { type ExecId, type PeekResult, isFailure, isSuccess, parseExecId } from 
 // state exactly as effect-encore: `Actor.registerState({ get, watch })`.
 export { registerState } from "./actor-state.ts";
 export type { ActorStateHandle } from "./actor-state.ts";
+
+// Workflow constructors live under the `Actor` namespace too: `Actor.fromWorkflow`.
+export { fromWorkflow, workflowEngineLayer } from "./workflow.ts";
+export type { WorkflowActor, WorkflowDef } from "./workflow.ts";
+
+import { type ActorKind, kindOf } from "./kind.ts";
+import type { WorkflowActor } from "./workflow.ts";
+
+/** Narrow an unknown value to an entity actor. */
+export const isEntity = (
+  value: unknown,
+): value is EntityActor<Record<string, AnyOperationDef>> => kindOf(value) === "entity";
+
+/** Narrow an unknown value to a workflow actor. */
+export const isWorkflow = (
+  value: unknown,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- WorkflowActor's params are erased at the guard boundary
+): value is WorkflowActor<string, any, any, any> => kindOf(value) === "workflow";
+
+/** The actor kind, or `undefined` for non-actors. */
+export const actorKind = (value: unknown): ActorKind | undefined => kindOf(value);
 
 // ── Operation definition ─────────────────────────────────────────────────
 
@@ -208,6 +230,8 @@ export interface ActorStateOptions<MError = never, MR = never> {
 
 export type EntityActor<Defs extends Record<string, AnyOperationDef>> = {
   readonly name: string;
+  /** The actor's type tag (for an entity, identical to `name`). */
+  readonly type: string;
 } & {
   readonly [Tag in keyof Defs & string]: OperationHandle<
     PayloadOf<Defs[Tag]>,
@@ -302,6 +326,17 @@ export type EntityActor<Defs extends Record<string, AnyOperationDef>> = {
     never,
     ActorStateRegistry
   >;
+
+  /** Typed identity for handler construction — infers handler types from the
+   *  defs when building handlers inside an `Effect.gen` that yields services.
+   *  Mirrors effect-encore's `Actor.of`. */
+  readonly of: <R>(handlers: EntityHandlers<Defs, R>) => EntityHandlers<Defs, R>;
+  /** Type guard narrowing an `OperationValue` to a specific operation tag. */
+  readonly $is: <Tag extends keyof Defs & string>(
+    tag: Tag,
+  ) => (
+    value: unknown,
+  ) => value is OperationValue<SuccessOf<Defs[Tag]>, ErrorOf<Defs[Tag]>>;
 };
 
 export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
@@ -420,7 +455,9 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
     });
 
   return {
+    [ActorKindId]: "entity",
     name,
+    type: name,
     ...handles,
     execute: executeOp,
     send: sendOp,
@@ -433,5 +470,12 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
     watchState: watchStateFn,
     waitForState: waitForStateFn,
     listStateEntityIds: () => listStateEntityIds(name),
+    of: <R>(h: EntityHandlers<Defs, R>) => h,
+    $is:
+      (tag: string) =>
+      (value: unknown): value is OperationValue =>
+        typeof value === "object" &&
+        value !== null &&
+        (value as { readonly _tag?: unknown })._tag === tag,
   } as unknown as EntityActor<Defs>;
 };

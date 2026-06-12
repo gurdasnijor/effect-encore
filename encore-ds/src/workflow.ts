@@ -3,6 +3,7 @@ import { Duration, Effect, type Layer, Option, Schedule, type Schema, Stream } f
 import { Workflow as UpstreamWorkflow } from "effect/unstable/workflow";
 import type { WorkflowEngine } from "effect/unstable/workflow/WorkflowEngine";
 import { DurableStreamsWorkflowEngine } from "../vendor/workflow-engine/durable-streams-workflow-engine.ts";
+import { ActorKindId } from "./kind.ts";
 import { exitToOutcome } from "./outcome.ts";
 import {
   type ExecId,
@@ -61,6 +62,8 @@ export interface WorkflowActor<
   Error extends Schema.Top,
 > {
   readonly name: Name;
+  /** The actor's type tag — `Workflow/<name>`. */
+  readonly type: string;
   readonly workflow: UpstreamWorkflow.Workflow<Name, Schema.Struct<Payload>, Success, Error>;
 
   readonly execute: (
@@ -149,8 +152,10 @@ export const fromWorkflow = <
   const execIdFor = (payload: PayloadIn<Payload>) => wf.executionId(payload as never);
 
   return {
+    [ActorKindId]: "workflow",
     ...signals,
     name,
+    type: `Workflow/${name}`,
     workflow: wf,
 
     execute: (payload) => wf.execute(payload as never) as Effect.Effect<any, any, WorkflowEngine>,
