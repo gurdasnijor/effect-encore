@@ -1,10 +1,10 @@
-import { Effect, type Schema, type Scope, Stream } from "effect";
+import { Effect, Layer, type Schema, type Scope, Stream } from "effect";
 import type { DurableTableError } from "../vendor/durable-operators/index.ts";
 import { type Behavior, type Handlers, activate } from "./activation.ts";
 import { type EntityIdReturn, deriveExecId, resolveId } from "./addressing.ts";
 import { type ActorTableService, withActor, withActorStream } from "./actor-table.ts";
 import {
-  type ActorStateRegistry,
+  ActorStateRegistry,
   type ActorStateUnavailable,
   CurrentActorAddress,
   listStateEntityIds,
@@ -13,6 +13,7 @@ import {
   watchStateOf,
 } from "./actor-state.ts";
 import type { EncoreConfig } from "./config.ts";
+import { advertiseEntity, directoryEntities } from "./directory.ts";
 import { ActorKindId } from "./kind.ts";
 import { type InboxMessage, enqueue } from "./mailbox.ts";
 import { peekReply, waitForReply, waitForReplyMatching, watchReply } from "./replies.ts";
@@ -140,8 +141,11 @@ const makeHandle = <P, S, E>(
 
   const send = (payload: P): Effect.Effect<ExecId<S, E>, DurableTableError, EncoreConfig> => {
     const { execId, entityId } = idOf(payload);
-    return withActor(actorType, entityId, (table) =>
-      Effect.as(enqueue(table, toInbox(payload)), execId),
+    // Advertise the entity so a `toLayer` host can discover + drain it, then
+    // durably enqueue. (Advertising is process-cached, so usually a no-op.)
+    return Effect.andThen(
+      advertiseEntity(actorType, entityId),
+      withActor(actorType, entityId, (table) => Effect.as(enqueue(table, toInbox(payload)), execId)),
     );
   };
 
@@ -175,7 +179,7 @@ const makeHandle = <P, S, E>(
 
   const execute = (payload: P): Effect.Effect<S, E | DurableTableError, EncoreConfig> => {
     const { execId, entityId } = idOf(payload);
-    return withActor(actorType, entityId, (table) =>
+    const run = withActor(actorType, entityId, (table) =>
       Effect.gen(function* () {
         yield* enqueue(table, toInbox(payload));
         const result = (yield* waitForReply(table, execId)) as PeekResult<S, E>;
@@ -185,6 +189,7 @@ const makeHandle = <P, S, E>(
         return yield* Effect.interrupt;
       }),
     );
+    return Effect.andThen(advertiseEntity(actorType, entityId), run);
   };
 
   const watch = (
@@ -479,3 +484,52 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
         (value as { readonly _tag?: unknown })._tag === tag,
   } as unknown as EntityActor<Defs>;
 };
+
+// ── Hosting: toLayer / toTestLayer ─────────────────────────────────────────
+
+/**
+ * Host an entity TYPE: a Layer that, once provided, drains every entity id that
+ * receives a dispatch — the encore-ds analogue of effect-encore's `toLayer`.
+ *
+ * It tails the per-type directory (populated by `send`/`execute`) and forks a
+ * drain for each id, deduped per process; it also provides `ActorStateRegistry`
+ * so clients in the same runtime can `getState`/`watchState`. When several hosts
+ * run, the per-id owner claim elects exactly one drainer.
+ *
+ * v1 caveat: discovery is forward-only — a host that already saw an id won't
+ * re-elect a drain if the current owner dies (epoch takeover is the deferred
+ * S2-fencing evolution). The directory also grows unbounded (no TTL yet).
+ */
+export const toLayer = <Defs extends Record<string, AnyOperationDef>, R = never>(
+  actor: EntityActor<Defs>,
+  behavior: EntityHandlers<Defs, R> | Effect.Effect<EntityHandlers<Defs, R>, never, R>,
+  options?: { readonly workerId?: string },
+): Layer.Layer<
+  ActorStateRegistry,
+  never,
+  EncoreConfig | Exclude<R, Scope.Scope | CurrentActorAddress | ActorStateRegistry>
+> => {
+  const hosting = new Set<string>();
+  const manager = Effect.forkScoped(
+    Stream.runForEach(directoryEntities(actor.type), (entityId) => {
+      if (hosting.has(entityId)) return Effect.void;
+      hosting.add(entityId);
+      return Effect.asVoid(
+        Effect.forkScoped(
+          actor.activate(entityId, behavior as EntityHandlers<Defs, R>, options),
+        ),
+      );
+    }),
+  );
+  return Layer.effectDiscard(manager).pipe(
+    Layer.provideMerge(ActorStateRegistry.Live),
+  ) as unknown as Layer.Layer<
+    ActorStateRegistry,
+    never,
+    EncoreConfig | Exclude<R, Scope.Scope | CurrentActorAddress | ActorStateRegistry>
+  >;
+};
+
+/** Test host. On the durable-streams backbone this is identical to `toLayer`
+ *  (no separate sharding config to bundle); kept for README parity. */
+export const toTestLayer = toLayer;

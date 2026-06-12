@@ -16,6 +16,16 @@ export const actorStreamUrl = (baseUrl: string, actorType: string, actorId: stri
   return `${base}/encore/${encodeURIComponent(actorType)}/${encodeURIComponent(actorId)}`;
 };
 
+/** Per-type directory stream: the set of entity ids that have received a
+ *  dispatch. A `toLayer` host tails it to learn which entities to drain — the
+ *  encore-ds analogue of cluster's shard/location tracking, addressed by name
+ *  (never enumerated). The reserved `__directory` segment cannot collide with a
+ *  real entity id stream. */
+export const directoryStreamUrl = (baseUrl: string, actorType: string): string => {
+  const base = baseUrl.replace(/\/+$/, "");
+  return `${base}/encore/${encodeURIComponent(actorType)}/__directory`;
+};
+
 // ── id() resolution — mirrors effect-encore's resolveId ──────────────────
 //
 // A single `id` fn yields either a string (entityId === primaryKey) or a

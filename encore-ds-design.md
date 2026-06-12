@@ -484,3 +484,43 @@ Two deliberate divergences from the README, both forced by the backbone:
 - **No `schedule` on `waitFor`.** The cluster original polls, so it takes a
   `Schedule`. The drain is push-based (replay-then-tail), so `waitFor` blocks on
   the reply feed directly; only the `filter` predicate is meaningful.
+
+---
+
+## 13. Hosting a TYPE — `toLayer` / `toTestLayer` (`directory.ts`)
+
+`activate(entityId, …)` hosts ONE entity. effect-encore's primary hosting shape
+is `Actor.toLayer(actor, handlers)` — a Layer that, once provided, hosts the
+whole entity *type*: dispatch to any id from anywhere and it's drained, with no
+per-id activation. That works in cluster because Sharding routes a message for
+id X to a runner that activates X on demand.
+
+encore-ds has no Sharding and the design forbids enumeration (no `readdir` /
+`listStreamPaths`, §8). The faithful analogue is a **per-type directory stream**
+(`directory.ts`): every `send`/`execute` advertises its entityId into
+`encore/<type>/__directory` (idempotent `insertOrGet`, process-cached so it's a
+no-op after the first dispatch to an id). `toLayer` tails that directory
+(replay-then-tail, so a late host still sees every prior id) and forks
+`activate(id, behavior)` for each, deduped per process; the per-id owner claim
+then elects exactly one drainer across hosts. The Layer also `provideMerge`s
+`ActorStateRegistry.Live`, so clients in the runtime can `getState`/`watchState`
+on hosted entities — matching the README's "Cold `getState` materializes the
+entity" story (here the host is already draining it).
+
+```ts
+const OrderLive = Actor.toLayer(Order, { Place: ({ item, qty }) => place(item, qty) });
+// provide OrderLive → any Order id dispatched anywhere is hosted:
+yield* Order.execute(Order.Place({ item: "widget", qty: 1 }));   // no activate(id)
+```
+
+`toTestLayer` is identical on this backbone (no separate sharding config to
+bundle); it exists for README parity.
+
+This is the encore-ds analogue of cluster's location tracking, and it inherits
+the design's swap-ability: directory layout lives behind `addressing.ts`
+(`directoryStreamUrl`), so a better backend changes one seam. Two honest v1
+caveats: discovery is **forward-only** — a host that already saw an id won't
+re-elect a drainer if the current owner dies (revocable single-writer / epoch
+takeover is the deferred S2-fencing work); and the directory **grows unbounded**
+(no `Stream-TTL` on entries yet). Both are isolated to `directory.ts` /
+`addressing.ts`.
