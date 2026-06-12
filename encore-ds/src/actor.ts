@@ -1,11 +1,11 @@
-import { Effect, type Schema } from "effect";
+import { Effect, type Schema, type Stream } from "effect";
 import type { DurableTableError } from "../vendor/durable-operators/index.ts";
 import { type Handlers, activate } from "./activation.ts";
 import { type EntityIdReturn, deriveExecId, resolveId } from "./addressing.ts";
-import { type ActorTableService, withActor } from "./actor-table.ts";
+import { type ActorTableService, withActor, withActorStream } from "./actor-table.ts";
 import type { EncoreConfig } from "./config.ts";
 import { type InboxMessage, enqueue } from "./mailbox.ts";
-import { peekReply, waitForReply } from "./replies.ts";
+import { peekReply, waitForReply, watchReply } from "./replies.ts";
 import { type ExecId, type PeekResult, isFailure, isSuccess } from "./receipt.ts";
 
 // ── Operation definition ─────────────────────────────────────────────────
@@ -45,6 +45,11 @@ export interface OperationHandle<P, S, E> {
   readonly waitFor: (
     payload: P,
   ) => Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig>;
+  /** Live status: replays the current outcome (if any) then tails until a
+   *  terminal `PeekResult` arrives, at which point the stream completes. */
+  readonly watch: (
+    payload: P,
+  ) => Stream.Stream<PeekResult<S, E>, DurableTableError, EncoreConfig>;
   /** Escape hatch: build the inbox message without dispatching. */
   readonly make: (payload: P) => InboxMessage;
 }
@@ -107,7 +112,19 @@ const makeHandle = <P, S, E>(
     );
   };
 
-  return { executionId, send, execute, peek, waitFor, make };
+  const watch = (
+    payload: P,
+  ): Stream.Stream<PeekResult<S, E>, DurableTableError, EncoreConfig> => {
+    const { execId, entityId } = idOf(payload);
+    return withActorStream(
+      actorType,
+      entityId,
+      (table) =>
+        watchReply(table, execId) as Stream.Stream<PeekResult<S, E>, DurableTableError>,
+    );
+  };
+
+  return { executionId, send, execute, peek, waitFor, watch, make };
 };
 
 // ── Entity actor ─────────────────────────────────────────────────────────

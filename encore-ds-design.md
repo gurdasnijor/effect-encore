@@ -189,7 +189,30 @@ waitFor = (p) => waitForReply(execId(p))                         // until termin
 ```
 
 `PeekResult` (Pending/Success/Failure/Interrupted/Defect/Suspended) ports verbatim
-from `receipt.ts`.
+from `receipt.ts`. `peek`/`waitFor`/`watch` are wired on the entity
+`OperationHandle`; `watch` returns the live `Stream<PeekResult>` (replay-then-tail,
+closing on the first terminal outcome) via `withActorStream`, which provides the
+actor's `ActorTable` layer for the stream's lifetime.
+
+### 5a. Surgical rerun is fence-bound — deferred to the epoch seam
+
+encore's `<Op>.rerun(payload)` clears the dedup cache so the *same* deterministic
+ExecId re-runs. On this substrate that is **not** a delete-and-resend: the ExecId
+is the DurableTable primary key, and `insertOrGet` appends under a durable
+producer identity keyed by that PK (`appendInsertWithPrimaryKeyFence`,
+`DurableTable.ts:467` — `producerId = durable-table:<type>:<key>`, fixed
+`epoch:0/seq:0`). The server's producer state is durable and **per-key**, so once
+an ExecId has been written, every later append for that key — from any process,
+after any logical `delete` of the row — resolves to the idempotent-`Found`
+branch. A delete leaves a tombstone the fence still shadows: re-inserting the
+same ExecId then hangs in `waitForStoredRow` (the row never reappears). Verified
+by running it against the live server.
+
+So faithful same-ExecId re-execution requires *bumping the producer epoch* for
+that key — exactly the revocable-single-writer evolution called out for the
+activation/claim seam (§3, "takeover by re-keying", and the S2-fencing note).
+Entity `rerun` is therefore deferred behind that seam rather than coarsened into
+a delete that the fence silently defeats.
 
 ---
 

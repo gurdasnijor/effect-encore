@@ -1,5 +1,5 @@
 import { DurableStreamTestServer } from "@durable-streams/server";
-import { Effect, Fiber, Ref, type Scope } from "effect";
+import { Effect, Fiber, Option, Ref, type Scope, Stream } from "effect";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import * as Actor from "../src/actor.ts";
 import type { OperationDef } from "../src/actor.ts";
@@ -161,6 +161,28 @@ describe("tiny-encore entity slice", () => {
       }),
     );
     expect(count).toBe(1); // replay did not re-run the handler
+  });
+
+  it("WATCH: streams the terminal outcome for a dispatch and then completes", async () => {
+    const id = freshId();
+    const out = await run(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkScoped(
+          Counter.activate(
+            id,
+            { Increment: (p) => Effect.succeed(p.amount + 1) },
+            { workerId: "w1" },
+          ),
+        );
+        yield* Counter.Increment.send({ id, amount: 41 });
+        // watch replays-then-tails and takes-until-terminal, so runHead resolves
+        // with the single terminal PeekResult once the handler records its reply.
+        const head = yield* Stream.runHead(Counter.Increment.watch({ id, amount: 41 }));
+        yield* Fiber.interrupt(fiber);
+        return Option.getOrNull(head);
+      }),
+    );
+    expect(out).toEqual({ _tag: "Success", value: 42 });
   });
 
   it("DRIVER: a cancel delivered mid-activation is observable (step interrupted)", async () => {
