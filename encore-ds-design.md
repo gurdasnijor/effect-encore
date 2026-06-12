@@ -391,3 +391,63 @@ spec:
   through `getState`/`watchState`/`waitForState`/`listStateEntityIds`.
 - **Where it lives (resolved).** In-repo under `encore-ds/`, to keep the surface
   diffable against the cluster version.
+
+---
+
+## 11. Behavior DSL — declarative state machines (`machine.ts`)
+
+A handler is just `(payload) => Effect<Success>`; a stateful entity is a handler
+set closing over a `SubscriptionRef`. That's flexible but, for a state machine,
+scatters legality across `if (phase !== ...)` checks. `machine.ts` adds a small
+**declarative** layer on top of the existing `Behavior` seam.
+
+Provenance: the surviving half of `Effect-TS/effect-smol#2351`. That PR began as
+a full in-process `Actor`/`ActorSystem` runtime, then **removed it** (commits
+`840678f`, `37d8642`) after maintainer feedback that a generic in-memory actor
+collides with the Cluster module — the same collision encore-ds exists to avoid.
+What shipped is `unstable/machine`: a statechart whose handlers are **pure and
+return the next state** (no Effect). We take exactly that idea — a pure, guarded
+transition table — and host it on the **durable** drain instead of an in-memory
+mailbox. We do NOT vendor the module: it is a churning draft (compound/parallel
+states still in flux) absent from any pinnable release, so `machine.ts` is a
+small owned reimplementation, deliberately **flat** (tagged state × tagged event,
+no nesting).
+
+```ts
+const machine = Machine.make<State, Event>({
+  initial,
+  on: {
+    awaiting_approval: {
+      ApproveTool: { enabled: (s, e) => s.pending.callId === e.callId,
+                     to: (s, e) => ({ _tag: "running_tool", ... }) },
+    },
+    running_tool: { ToolResult: { to: (s, e) => ({ _tag: "idle", toolRuns: s.toolRuns + 1 }) } },
+  },
+  onUnhandled: (s, e) => reject(s, e),   // illegal/out-of-phase event
+});
+
+Entity.activate(id, machine.behavior());  // plugs straight into the Behavior seam
+```
+
+Why it fits encore-ds specifically:
+
+- **Legality is the table SHAPE.** `ApproveTool` only exists under
+  `awaiting_approval`; an out-of-phase event hits `onUnhandled`. The permission
+  gate is structural, not a scattered guard. `to`/`enabled` receive the state
+  already narrowed to the current tag (typed `s.pending`).
+- **Pure handlers are replay-safe.** The drain is replay-then-tail and short-
+  circuits on a recorded reply; a pure `step` recomputes the same next state if a
+  recorded event is ever re-applied. (The smol PR adopted purity for its own
+  reasons; here it also buys replay-safety.)
+- **Snapshots are the state handle.** `behavior()` registers the machine's
+  `SubscriptionRef` via `Actor.registerState`, so `getState`/`watchState` observe
+  it for free — inbox ops in, snapshots out.
+- **Inbox ops ARE events.** Op tags map to event tags (`{ _tag, ...payload }`);
+  the durable drain feeds them in arrival order.
+
+Conformance: `test/agent-session-machine.test.ts` re-expresses the
+`agent-session` machine declaratively — pure `step` unit tests (no substrate)
+plus one hosted end-to-end through `activate` + `getState`. The seam is the
+upgrade path: if upstream's `Machine` stabilises in a pinnable release,
+`behavior()` is where a vendored/real `Machine` would be wrapped, leaving the
+flat reimplementation as the fallback.

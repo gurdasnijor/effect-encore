@@ -1,6 +1,6 @@
 import { Effect, type Schema, type Scope, Stream } from "effect";
 import type { DurableTableError } from "../vendor/durable-operators/index.ts";
-import { type Behavior, activate } from "./activation.ts";
+import { type Behavior, type Handlers, activate } from "./activation.ts";
 import { type EntityIdReturn, deriveExecId, resolveId } from "./addressing.ts";
 import { type ActorTableService, withActor, withActorStream } from "./actor-table.ts";
 import {
@@ -178,7 +178,10 @@ export type EntityActor<Defs extends Record<string, AnyOperationDef>> = {
     entityId: string,
     behavior:
       | EntityHandlers<Defs, R>
-      | Effect.Effect<EntityHandlers<Defs, R>, never, R>,
+      | Effect.Effect<EntityHandlers<Defs, R>, never, R>
+      // A prebuilt behavior (e.g. `Machine.make(...).behavior()`) — Effect-only
+      // so an inline handlers object still resolves to the typed member above.
+      | Effect.Effect<Handlers<R>, never, R>,
     options?: { readonly workerId?: string; readonly epoch?: number },
   ) => Effect.Effect<
     void,

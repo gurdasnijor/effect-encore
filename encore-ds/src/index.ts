@@ -3,6 +3,8 @@
 // DurableStreamsWorkflowEngine — see task #6.
 
 export * as Actor from "./actor.ts";
+export * as Machine from "./machine.ts";
+export type { MachineDef, Transition } from "./machine.ts";
 export { EncoreConfig, type EncoreConfigShape } from "./config.ts";
 export {
   type ActorAddress,
