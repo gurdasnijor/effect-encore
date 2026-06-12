@@ -524,3 +524,24 @@ re-elect a drainer if the current owner dies (revocable single-writer / epoch
 takeover is the deferred S2-fencing work); and the directory **grows unbounded**
 (no `Stream-TTL` on entries yet). Both are isolated to `directory.ts` /
 `addressing.ts`.
+
+---
+
+## 14. Sender-only await + coarse lifecycle
+
+- **`Op.sendAndAwait(payload, { timeout })`.** The README's sender-only await:
+  durably enqueue, then poll the persisted reply until terminal or `timeout`
+  (then fail `SendAndAwaitTimeout`). On this backbone `execute` is already
+  sender-only (no Sharding to host), so the only thing `sendAndAwait` adds over
+  `execute` is the bounded wait — exactly the README's framing ("guards against
+  unbounded sender-side polling"). A `toLayer` host elsewhere produces the reply.
+- **`Entity.flush/redeliver/interrupt(entityId)`.** Coarse lifecycle, mapped onto
+  the three per-actor collections: `flush` deletes messages + replies + the drain
+  claim (clean slate); `interrupt` deletes the mailbox only (stop accepting,
+  replies survive); `redeliver` deletes the drain claim so a fresh activation
+  re-claims and re-drains the un-replied messages (the encore-ds analogue of
+  clearing read leases — there is no read cursor, the drain always replays).
+  In-flight handlers run to completion (no passivation primitive). These delete
+  by enumerating the *entity's own* three collections (not a global readdir), so
+  invariant 2 holds; and because deleted ExecIds stay producer-fenced, they are
+  abandon-style operations, not a path to re-run the same ExecId.

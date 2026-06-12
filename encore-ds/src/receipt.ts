@@ -1,4 +1,12 @@
-import { Schema } from "effect";
+import { Data, Schema } from "effect";
+
+/** Raised by `sendAndAwait` when the persisted reply does not arrive within the
+ *  required `timeout` — guards sender-side polling against running unbounded. */
+export class SendAndAwaitTimeout extends Data.TaggedError(
+  "encore-ds/SendAndAwaitTimeout",
+)<{
+  readonly execId: string;
+}> {}
 
 // ── ExecId — branded execution identifier ────────────────────────────────
 //

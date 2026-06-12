@@ -1,4 +1,4 @@
-import { Effect, Layer, type Schema, type Scope, Stream } from "effect";
+import { type Duration, Effect, Layer, Option, type Schema, type Scope, Stream } from "effect";
 import type { DurableTableError } from "../vendor/durable-operators/index.ts";
 import { type Behavior, type Handlers, activate } from "./activation.ts";
 import { type EntityIdReturn, deriveExecId, resolveId } from "./addressing.ts";
@@ -17,7 +17,14 @@ import { advertiseEntity, directoryEntities } from "./directory.ts";
 import { ActorKindId } from "./kind.ts";
 import { type InboxMessage, enqueue } from "./mailbox.ts";
 import { peekReply, waitForReply, waitForReplyMatching, watchReply } from "./replies.ts";
-import { type ExecId, type PeekResult, isFailure, isSuccess, parseExecId } from "./receipt.ts";
+import {
+  type ExecId,
+  type PeekResult,
+  SendAndAwaitTimeout,
+  isFailure,
+  isSuccess,
+  parseExecId,
+} from "./receipt.ts";
 
 // Re-exported under the `Actor` namespace so entity handlers can publish live
 // state exactly as effect-encore: `Actor.registerState({ get, watch })`.
@@ -101,6 +108,13 @@ export type OperationHandle<P, S, E> = {
   /** Enqueue then await the terminal outcome; surface the success value or fail
    *  with the operation's error. */
   readonly execute: (payload: P) => Effect.Effect<S, E | DurableTableError, EncoreConfig>;
+  /** Sender-only `execute`: durably enqueue, then poll the persisted reply until
+   *  terminal or `timeout` (then fail `SendAndAwaitTimeout`). Needs no local
+   *  host — a `toLayer` host elsewhere drains it. */
+  readonly sendAndAwait: (
+    payload: P,
+    options: { readonly timeout: Duration.Input },
+  ) => Effect.Effect<S, E | DurableTableError | SendAndAwaitTimeout, EncoreConfig>;
   /** Non-blocking status. */
   readonly peek: (payload: P) => Effect.Effect<PeekResult<S, E>, DurableTableError, EncoreConfig>;
   /** Block until the reply matches (default: first terminal), then return it. */
@@ -192,6 +206,26 @@ const makeHandle = <P, S, E>(
     return Effect.andThen(advertiseEntity(actorType, entityId), run);
   };
 
+  const sendAndAwait = (
+    payload: P,
+    options: { readonly timeout: Duration.Input },
+  ): Effect.Effect<S, E | DurableTableError | SendAndAwaitTimeout, EncoreConfig> => {
+    const { execId, entityId } = idOf(payload);
+    const run = withActor(actorType, entityId, (table) =>
+      Effect.gen(function* () {
+        yield* enqueue(table, toInbox(payload));
+        const timed = yield* Effect.timeoutOption(waitForReply(table, execId), options.timeout);
+        if (Option.isNone(timed)) return yield* Effect.fail(new SendAndAwaitTimeout({ execId }));
+        const result = timed.value as PeekResult<S, E>;
+        if (isSuccess(result)) return result.value;
+        if (isFailure(result)) return yield* Effect.fail(result.error);
+        if (result._tag === "Defect") return yield* Effect.die(result.cause);
+        return yield* Effect.interrupt;
+      }),
+    );
+    return Effect.andThen(advertiseEntity(actorType, entityId), run);
+  };
+
   const watch = (
     payload: P,
   ): Stream.Stream<PeekResult<S, E>, DurableTableError, EncoreConfig> => {
@@ -211,6 +245,7 @@ const makeHandle = <P, S, E>(
     executionId,
     send,
     execute,
+    sendAndAwait,
     peek,
     waitFor,
     watch,
@@ -332,6 +367,17 @@ export type EntityActor<Defs extends Record<string, AnyOperationDef>> = {
     ActorStateRegistry
   >;
 
+  // ── Lifecycle (coarse — see design §13/gotchas) ─────────────────────────
+  /** Clean slate: delete the entity's mailbox, replies, and drain claim. */
+  readonly flush: (entityId: string) => Effect.Effect<void, DurableTableError, EncoreConfig>;
+  /** Release the drain claim so a fresh activation re-claims and re-drains the
+   *  still-queued (un-replied) messages. The encore-ds analogue of clearing
+   *  read leases. */
+  readonly redeliver: (entityId: string) => Effect.Effect<void, DurableTableError, EncoreConfig>;
+  /** Stop accepting work: clear the mailbox (keeps replies). In-flight handlers
+   *  run to completion — there is no passivation primitive on this backbone. */
+  readonly interrupt: (entityId: string) => Effect.Effect<void, DurableTableError, EncoreConfig>;
+
   /** Typed identity for handler construction — infers handler types from the
    *  defs when building handlers inside an `Effect.gen` that yields services.
    *  Mirrors effect-encore's `Actor.of`. */
@@ -367,6 +413,37 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
     ) as Effect.Effect<void, DurableTableError, Exclude<R, Scope.Scope | CurrentActorAddress> | EncoreConfig>;
 
   const address = (entityId: string) => ({ entityType: name, entityId });
+
+  // ── Lifecycle: delete every row of a collection (coarse cleanup) ──────────
+  const clearCollection = (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- erase the per-collection row type for a generic clear
+    coll: {
+      readonly query: <A>(build: (c: { readonly toArray: ReadonlyArray<any> }) => A) => Effect.Effect<A, DurableTableError>;
+      readonly delete: (key: string) => Effect.Effect<void, DurableTableError>;
+    },
+    keyOf: (row: Record<string, unknown>) => unknown,
+  ): Effect.Effect<void, DurableTableError> =>
+    Effect.gen(function* () {
+      const rows = yield* coll.query((c) => c.toArray);
+      let i = 0;
+      while (i < rows.length) {
+        yield* coll.delete(String(keyOf(rows[i] as Record<string, unknown>)));
+        i += 1;
+      }
+    });
+
+  const flush = (entityId: string): Effect.Effect<void, DurableTableError, EncoreConfig> =>
+    withActor(name, entityId, (table) =>
+      Effect.gen(function* () {
+        yield* clearCollection(table.messages, (r) => r["msgId"]);
+        yield* clearCollection(table.replies, (r) => r["execId"]);
+        yield* clearCollection(table.owner, (r) => r["key"]);
+      }),
+    );
+  const redeliver = (entityId: string): Effect.Effect<void, DurableTableError, EncoreConfig> =>
+    withActor(name, entityId, (table) => clearCollection(table.owner, (r) => r["key"]));
+  const interrupt = (entityId: string): Effect.Effect<void, DurableTableError, EncoreConfig> =>
+    withActor(name, entityId, (table) => clearCollection(table.messages, (r) => r["msgId"]));
 
   // ── Unified call site: dispatch a built OperationValue by delegating to its
   // operation handle (which carries the `id` fn → entityId + ExecId). ────────
@@ -471,6 +548,9 @@ export const fromEntity = <const Defs extends Record<string, AnyOperationDef>>(
     watch: watchById,
     waitFor: waitForById,
     activate: activateEntity,
+    flush,
+    redeliver,
+    interrupt,
     getState: getStateFn,
     watchState: watchStateFn,
     waitForState: waitForStateFn,

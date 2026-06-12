@@ -32,6 +32,7 @@ export {
   Interrupted,
   Defect,
   Suspended,
+  SendAndAwaitTimeout,
 } from "./receipt.ts";
 export { CANCEL_TAG } from "./mailbox.ts";
 export type { EntityIdReturn } from "./addressing.ts";
