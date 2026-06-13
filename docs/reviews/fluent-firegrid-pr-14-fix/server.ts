@@ -1,15 +1,14 @@
-// Corrected `packages/fluent-durable-streams/src/server.ts` for fluent-firegrid PR #14.
-//
-// Changes vs the PR:
-//   1. `apiError` maps S2 failures onto status-distinct tagged errors (409/416/422/502)
-//      instead of flattening everything into a single HTTP 502 envelope.
-//   2. `read` / `readState` gain a live `?live=sse` branch that returns a `Stream`
-//      of S2 `batch` events over an S2 read session (no buffering, real backpressure).
-//   3. `readRaw` returns a `Stream<Uint8Array>` straight from S2's `as: "bytes"` records.
-//
-// The only symbol that must be reconciled with the actual SDK is the S2 read-session
-// call, marked `// ⟵ confirm S2 SDK`. Everything else is pinned to the v4 HttpApi docs.
-
+/**
+ * `@firegrid/fluent-durable-streams` — HTTP API handlers.
+ *
+ * Binds {@link DurableStreamsApi} to the official `@s2-dev/streamstore` SDK via
+ * the {@link S2Profile} service. Reads come in three shapes — buffered catch-up,
+ * long-poll, and live SSE read sessions — and S2 failures keep their native HTTP
+ * status (spec §13) instead of collapsing to a single code.
+ *
+ * The only call that must be reconciled with the installed SDK version is the
+ * live read **session** (`stream.readSession`), marked `// ⟵ confirm S2 SDK`.
+ */
 import {
   AppendInput,
   AppendRecord,
@@ -30,18 +29,23 @@ import type {
   ReadBatch,
   ReadQuery,
   ReadRecord,
+  RecordKind,
   StateMessage,
   StateReadBatch,
   StateRecord,
   StreamPosition,
 } from "./api.ts"
 import {
+  AppendConditionFailed,
   BadRequestError,
   ConflictError,
   DurableStreamsApi,
-  RangeNotSatisfiableError as ApiRangeNotSatisfiableError,
+  ForbiddenError,
+  NotFoundError,
+  RangeNotSatisfiableError,
   StateMessage as StateMessageSchema,
-  UnprocessableError,
+  StateRecordError,
+  TimeoutError,
   UpstreamError,
 } from "./api.ts"
 import { S2Profile, type S2ProfileError, type S2ProfileService } from "./s2.ts"
@@ -49,6 +53,13 @@ import { tryS2 } from "./errors.ts"
 
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
+
+const KIND_HEADER = "ds-kind"
+const CLOSE_HEADER: readonly [string, string] = [KIND_HEADER, "close"]
+
+// ---------------------------------------------------------------------------
+// Encoding helpers
+// ---------------------------------------------------------------------------
 
 const decodeBase64 = (value: string): Uint8Array =>
   Uint8Array.from(atob(value), (char) => char.charCodeAt(0))
@@ -61,12 +72,10 @@ const fromHeaderPair = ([name, value]: readonly [string, string]): readonly [Uin
   textEncoder.encode(value),
 ]
 
-const stringHeader = (name: string, value: string): readonly [string, string] => [name, value]
-
-const toHeaderPair = ([name, value]: readonly [Uint8Array, Uint8Array]): readonly [string, string] => [
-  encodeBase64(name),
-  encodeBase64(value),
-]
+const decodeHeaders = (
+  headers: ReadonlyArray<readonly [Uint8Array, Uint8Array]>,
+): ReadonlyArray<readonly [string, string]> =>
+  headers.map(([name, value]) => [textDecoder.decode(name), textDecoder.decode(value)] as const)
 
 const textHeaderValue = (
   headers: ReadonlyArray<readonly [Uint8Array, Uint8Array]>,
@@ -76,43 +85,54 @@ const textHeaderValue = (
   return value === undefined ? undefined : textDecoder.decode(value)
 }
 
-const streamPosition = (position: S2StreamPosition): StreamPosition =>
-  ({
-    seqNum: position.seqNum,
-    timestamp: position.timestamp.toISOString(),
-  })
-
-const appendAck = (ack: S2AppendAck): AppendAck =>
-  ({
-    start: streamPosition(ack.start),
-    end: streamPosition(ack.end),
-    tail: streamPosition(ack.tail),
-  })
-
-const readRecord = (record: S2ReadRecord<"bytes">): ReadRecord =>
-  ({
-    seqNum: record.seqNum,
-    bodyBase64: encodeBase64(record.body),
-    headers: record.headers.map(toHeaderPair),
-    timestamp: record.timestamp.toISOString(),
-  })
-
-const readBatch = (batch: S2ReadBatch<"bytes">): ReadBatch => {
-  const payload = {
-    records: batch.records.map(readRecord),
-    ...(batch.tail === undefined ? {} : { tail: streamPosition(batch.tail) }),
-  }
-  return payload
+const recordKind = (headers: ReadonlyArray<readonly [Uint8Array, Uint8Array]>): RecordKind => {
+  const value = textHeaderValue(headers, KIND_HEADER)
+  return value === "close" || value === "meta" ? value : "data"
 }
+
+// ---------------------------------------------------------------------------
+// S2 → API projections
+// ---------------------------------------------------------------------------
+
+const streamPosition = (position: S2StreamPosition): StreamPosition => ({
+  seqNum: position.seqNum,
+  timestamp: position.timestamp.toISOString(),
+})
+
+const appendAck = (ack: S2AppendAck): AppendAck => ({
+  start: streamPosition(ack.start),
+  end: streamPosition(ack.end),
+  tail: streamPosition(ack.tail),
+})
+
+const readRecord = (record: S2ReadRecord<"bytes">): ReadRecord => ({
+  seqNum: record.seqNum,
+  body: encodeBase64(record.body),
+  kind: recordKind(record.headers),
+  headers: decodeHeaders(record.headers),
+  timestamp: record.timestamp.toISOString(),
+})
+
+const isClosed = (batch: S2ReadBatch<"bytes">): boolean =>
+  batch.records.some((record) => recordKind(record.headers) === "close")
+
+const readBatch = (batch: S2ReadBatch<"bytes">): ReadBatch => ({
+  records: batch.records.map(readRecord),
+  ...(batch.tail === undefined ? {} : { tail: streamPosition(batch.tail) }),
+  ...(isClosed(batch) ? { closed: true } : {}),
+})
+
+// ---------------------------------------------------------------------------
+// State projection
+// ---------------------------------------------------------------------------
 
 const isStateChange = (message: StateMessage): message is Extract<StateMessage, { readonly type: string }> =>
   "type" in message
 
+const stringHeader = (name: string, value: string): readonly [string, string] => [name, value]
+
 const optionalStateHeaders = (
-  headers: Readonly<{
-    readonly txid?: string | undefined
-    readonly schema?: string | undefined
-  }>,
+  headers: Readonly<{ readonly txid?: string | undefined; readonly schema?: string | undefined }>,
 ): ReadonlyArray<readonly [string, string]> => [
   ...(headers.txid === undefined ? [] : [stringHeader("ds-state-txid", headers.txid)]),
   ...(headers.schema === undefined ? [] : [stringHeader("ds-state-schema", headers.schema)]),
@@ -120,7 +140,7 @@ const optionalStateHeaders = (
 
 const stateHeaders = (message: StateMessage): ReadonlyArray<readonly [string, string]> => {
   const base = [
-    stringHeader("ds-kind", "state"),
+    stringHeader(KIND_HEADER, "state"),
     stringHeader("ds-content-type", "application/vnd.firegrid.state+json"),
   ]
   if (isStateChange(message)) {
@@ -142,17 +162,13 @@ const stateHeaders = (message: StateMessage): ReadonlyArray<readonly [string, st
 }
 
 const stateAppendRecord = (message: StateMessage): AppendRecord =>
-  AppendRecord.string({
-    body: JSON.stringify(message),
-    headers: stateHeaders(message),
-  })
+  AppendRecord.string({ body: JSON.stringify(message), headers: stateHeaders(message) })
 
 const decodeStateRecord = (record: S2ReadRecord<"bytes">): Effect.Effect<StateRecord, ApiError> => {
-  if (textHeaderValue(record.headers, "ds-kind") !== "state") {
-    return Effect.fail(new UnprocessableError({
-      message: `S2 record ${record.seqNum} is not a state record`,
-      code: "not-state-record",
-    }))
+  if (textHeaderValue(record.headers, KIND_HEADER) !== "state") {
+    return Effect.fail(
+      new StateRecordError({ message: `S2 record ${record.seqNum} is not a state record`, code: "not-state-record" }),
+    )
   }
   return Schema.decodeUnknownEffect(StateMessageSchema)(JSON.parse(textDecoder.decode(record.body))).pipe(
     Effect.map((message): StateRecord => ({
@@ -161,39 +177,66 @@ const decodeStateRecord = (record: S2ReadRecord<"bytes">): Effect.Effect<StateRe
       message,
     })),
     Effect.mapError((error) =>
-      new UnprocessableError({
-        message: `Invalid state record ${record.seqNum}: ${String(error)}`,
-        code: "invalid-state-record",
-      }),
+      new StateRecordError({ message: `Invalid state record ${record.seqNum}: ${String(error)}`, code: "invalid-state-record" })
     ),
   )
 }
 
 const stateReadBatch = (batch: S2ReadBatch<"bytes">): Effect.Effect<StateReadBatch, ApiError> =>
   Effect.forEach(
-    batch.records.filter((record) => textHeaderValue(record.headers, "ds-kind") === "state"),
+    batch.records.filter((record) => textHeaderValue(record.headers, KIND_HEADER) === "state"),
     decodeStateRecord,
   ).pipe(
     Effect.map((records) => ({
       records,
       ...(batch.tail === undefined ? {} : { tail: streamPosition(batch.tail) }),
+      ...(isClosed(batch) ? { closed: true } : {}),
     })),
   )
 
-// Honest status mapping: 4xx S2 failures stay 4xx; only true upstream failures are 502.
-const apiError = (error: S2ProfileError): ApiError => {
-  const code = (error as { readonly code?: string }).code
-  const withCode = (message: string) => ({ message, ...(code === undefined ? {} : { code }) })
-  if (error instanceof SeqNumMismatchError || error instanceof FencingTokenMismatchError) {
-    return new ConflictError(withCode(error.message))
+// ---------------------------------------------------------------------------
+// Error mapping — preserve S2's native HTTP status (spec §13)
+// ---------------------------------------------------------------------------
+
+const codeOf = (error: unknown): string | undefined => (error as { readonly code?: string }).code
+
+/**
+ * Map an {@link S2ProfileError} onto a status-distinct API error. Append-condition
+ * failures become `412` (not `409`); every other S2 status is preserved exactly;
+ * unknown/5xx failures become `502`.
+ */
+export const apiError = (error: S2ProfileError): ApiError => {
+  const code = codeOf(error)
+  const fields = (message: string) => ({ message, ...(code === undefined ? {} : { code }) })
+
+  if (error instanceof SeqNumMismatchError) {
+    return new AppendConditionFailed({ ...fields(error.message), reason: "seq_num_mismatch" })
+  }
+  if (error instanceof FencingTokenMismatchError) {
+    return new AppendConditionFailed({ ...fields(error.message), reason: "fencing_token_mismatch" })
   }
   if (error instanceof S2RangeNotSatisfiableError) {
-    return new ApiRangeNotSatisfiableError(withCode(error.message))
+    return new RangeNotSatisfiableError(fields(error.message))
   }
   if (error instanceof S2Error) {
-    return error.status >= 400 && error.status < 500
-      ? new BadRequestError(withCode(error.message))
-      : new UpstreamError(withCode(error.message))
+    switch (error.status) {
+      case 400:
+        return new BadRequestError(fields(error.message))
+      case 403:
+        return new ForbiddenError(fields(error.message))
+      case 404:
+        return new NotFoundError(fields(error.message))
+      case 408:
+        return new TimeoutError(fields(error.message))
+      case 409:
+        return new ConflictError(fields(error.message))
+      case 412:
+        return new AppendConditionFailed(fields(error.message))
+      case 416:
+        return new RangeNotSatisfiableError(fields(error.message))
+      default:
+        return new UpstreamError(fields(error.message))
+    }
   }
   return new UpstreamError({ message: "Unknown S2 error" })
 }
@@ -201,15 +244,14 @@ const apiError = (error: S2ProfileError): ApiError => {
 const catchS2 = <A, R>(effect: Effect.Effect<A, S2ProfileError, R>): Effect.Effect<A, ApiError, R> =>
   Effect.mapError(effect, apiError)
 
-const appendOptions = (
-  input: Readonly<{
-    readonly matchSeqNum?: number | undefined
-    readonly fencingToken?: string | undefined
-  }>,
-): Readonly<{
-  readonly matchSeqNum?: number
-  readonly fencingToken?: string
-}> => ({
+// ---------------------------------------------------------------------------
+// S2 calls
+// ---------------------------------------------------------------------------
+
+const appendOptions = (input: {
+  readonly matchSeqNum?: number | undefined
+  readonly fencingToken?: string | undefined
+}): { readonly matchSeqNum?: number; readonly fencingToken?: string } => ({
   ...(input.matchSeqNum === undefined ? {} : { matchSeqNum: input.matchSeqNum }),
   ...(input.fencingToken === undefined ? {} : { fencingToken: input.fencingToken }),
 })
@@ -221,9 +263,7 @@ const readInput = (query: ReadQuery) => ({
       : { from: { seqNum: query.seqNum }, clamp: true }
     : { from: { tailOffset: query.tailOffset }, clamp: true },
   stop: {
-    limits: {
-      ...(query.count === undefined ? {} : { count: query.count }),
-    },
+    limits: { ...(query.count === undefined ? {} : { count: query.count }) },
     ...(query.waitSecs === undefined ? {} : { waitSecs: query.waitSecs }),
   },
   ignoreCommandRecords: query.ignoreCommandRecords ?? true,
@@ -233,33 +273,20 @@ const appendRecords = (
   profile: S2ProfileService,
   stream: string,
   records: ReadonlyArray<AppendRecord>,
-  conditions: Readonly<{
-    readonly matchSeqNum?: number | undefined
-    readonly fencingToken?: string | undefined
-  }>,
-) =>
-  catchS2(tryS2(() =>
-    profile.basin.stream(stream).append(
-      AppendInput.create(records, appendOptions(conditions)),
-    ),
-  ))
+  conditions: { readonly matchSeqNum?: number | undefined; readonly fencingToken?: string | undefined },
+) => catchS2(tryS2(() => profile.basin.stream(stream).append(AppendInput.create(records, appendOptions(conditions)))))
 
-// Buffered, single-batch catch-up read (unchanged behaviour, used when `live` is absent).
-const readBytes = (
-  profile: S2ProfileService,
-  stream: string,
-  query: ReadQuery,
-) =>
-  catchS2(tryS2(() =>
-    profile.basin.stream(stream).read(
-      readInput(query),
-      { as: "bytes" },
-    ),
-  ))
+/** Buffered single-batch catch-up read (used when `live` is absent). */
+const readBytes = (profile: S2ProfileService, stream: string, query: ReadQuery) =>
+  catchS2(tryS2(() => profile.basin.stream(stream).read(readInput(query), { as: "bytes" })))
 
-// Live read session: yields successive S2 ReadBatches as a backpressured Effect Stream.
-// ⟵ confirm S2 SDK: the streaming session entry point (the unary `.read(...)` above
-//   returns a single batch; the session must yield an AsyncIterable of batches).
+/**
+ * Live read session — successive S2 `ReadBatch`es as a backpressured Stream,
+ * terminating after a `ds-kind: close` record (EOF, spec §8.2).
+ *
+ * ⟵ confirm S2 SDK: `readSession` is the SDK's streaming entry point (the unary
+ *   `read` above returns one batch; the session yields an AsyncIterable of batches).
+ */
 const readSession = (
   profile: S2ProfileService,
   stream: string,
@@ -268,7 +295,11 @@ const readSession = (
   Stream.fromAsyncIterable(
     profile.basin.stream(stream).readSession(readInput(query), { as: "bytes" }), // ⟵ confirm S2 SDK
     (cause) => apiError(cause as S2ProfileError),
-  )
+  ).pipe(Stream.takeUntil(isClosed))
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
 export const StreamsLive = HttpApiBuilder.group(
   DurableStreamsApi,
@@ -279,34 +310,36 @@ export const StreamsLive = HttpApiBuilder.group(
         Effect.gen(function*() {
           const profile = yield* S2Profile
           const response = yield* catchS2(tryS2(() => profile.basin.streams.ensure({ stream: params.stream })))
-          return {
-            result: response.result,
-            stream: response.stream.name,
-          }
+          return { result: response.result, stream: response.stream.name }
         }))
       .handle("checkTail", ({ params }) =>
         Effect.gen(function*() {
           const profile = yield* S2Profile
           const response = yield* catchS2(tryS2(() => profile.basin.stream(params.stream).checkTail()))
-          return streamPosition(response.tail)
+          return { tail: streamPosition(response.tail) }
         }))
       .handle("append", ({ params, payload }) =>
         Effect.gen(function*() {
           const profile = yield* S2Profile
           const records = payload.records.map((record) =>
             AppendRecord.bytes({
-              body: decodeBase64(record.bodyBase64),
+              body: decodeBase64(record.body),
               headers: (record.headers ?? []).map(fromHeaderPair),
-            }),
+            })
           )
-          const response = yield* appendRecords(profile, params.stream, records, payload)
-          return appendAck(response)
+          return appendAck(yield* appendRecords(profile, params.stream, records, payload))
         }))
       .handle("appendRaw", ({ params, query, payload }) =>
         Effect.gen(function*() {
           const profile = yield* S2Profile
-          const response = yield* appendRecords(profile, params.stream, [AppendRecord.bytes({ body: payload })], query)
-          return appendAck(response)
+          const record = AppendRecord.bytes({ body: payload })
+          return appendAck(yield* appendRecords(profile, params.stream, [record], query))
+        }))
+      .handle("close", ({ params, query }) =>
+        Effect.gen(function*() {
+          const profile = yield* S2Profile
+          const record = AppendRecord.bytes({ body: new Uint8Array(0), headers: [fromHeaderPair(CLOSE_HEADER)] })
+          return appendAck(yield* appendRecords(profile, params.stream, [record], query))
         }))
       .handle("read", ({ params, query }) =>
         Effect.gen(function*() {
@@ -316,8 +349,7 @@ export const StreamsLive = HttpApiBuilder.group(
               Stream.map((batch) => ({ event: "batch" as const, data: readBatch(batch) })),
             )
           }
-          const response = yield* readBytes(profile, params.stream, query)
-          return readBatch(response)
+          return readBatch(yield* readBytes(profile, params.stream, query))
         }))
       .handle("readRaw", ({ params, query }) =>
         Effect.gen(function*() {
@@ -338,8 +370,8 @@ export const StateLive = HttpApiBuilder.group(
       .handle("appendState", ({ params, payload }) =>
         Effect.gen(function*() {
           const profile = yield* S2Profile
-          const response = yield* appendRecords(profile, params.stream, payload.records.map(stateAppendRecord), payload)
-          return appendAck(response)
+          const records = payload.records.map(stateAppendRecord)
+          return appendAck(yield* appendRecords(profile, params.stream, records, payload))
         }))
       .handle("readState", ({ params, query }) =>
         Effect.gen(function*() {
@@ -350,8 +382,7 @@ export const StateLive = HttpApiBuilder.group(
               Stream.map((batch) => ({ event: "batch" as const, data: batch })),
             )
           }
-          const response = yield* readBytes(profile, params.stream, query)
-          return yield* stateReadBatch(response)
+          return yield* stateReadBatch(yield* readBytes(profile, params.stream, query))
         })),
 )
 
