@@ -117,12 +117,12 @@ export const fromWorkflow = <
   if (def.error) options["error"] = def.error;
   if (def.suspendedRetrySchedule) options["suspendedRetrySchedule"] = def.suspendedRetrySchedule;
 
-  let wf = (UpstreamWorkflow.make as (n: string, o: unknown) => UpstreamWorkflow.Workflow<
-    Name,
-    Schema.Struct<Payload>,
-    Success,
-    Error
-  >)(name, options);
+  let wf = (
+    UpstreamWorkflow.make as (
+      n: string,
+      o: unknown,
+    ) => UpstreamWorkflow.Workflow<Name, Schema.Struct<Payload>, Success, Error>
+  )(name, options);
   if (def.captureDefects !== undefined)
     wf = wf.annotate(UpstreamWorkflow.CaptureDefects, def.captureDefects);
   if (def.suspendOnFailure !== undefined)

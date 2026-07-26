@@ -17,8 +17,7 @@ afterAll(async () => {
 
 const engineUrl = () => `${baseUrl}/v1/stream/wf-${crypto.randomUUID()}`;
 
-const run = <A, E>(eff: Effect.Effect<A, E, Scope.Scope>) =>
-  Effect.runPromise(Effect.scoped(eff));
+const run = <A, E>(eff: Effect.Effect<A, E, Scope.Scope>) => Effect.runPromise(Effect.scoped(eff));
 
 describe("tiny-encore workflow slice", () => {
   it("WORKFLOW: a durable step runs once and the execution is memoized on re-execute", async () => {

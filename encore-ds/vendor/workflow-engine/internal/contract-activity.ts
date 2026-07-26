@@ -1,5 +1,5 @@
-import type { Activity } from "effect/unstable/workflow"
-import { Effect } from "effect"
+import type { Activity } from "effect/unstable/workflow";
+import { Effect } from "effect";
 
 /**
  * Contract-coverage seam annotations for runtime-owned `Activity.make` spans.
@@ -43,22 +43,22 @@ type FiregridSeamKind =
   | "concurrency"
   | "ordering"
   | "bridge_debt"
-  | "relay"
+  | "relay";
 
 interface ActivityContract {
-  readonly seamKind: FiregridSeamKind
+  readonly seamKind: FiregridSeamKind;
   /**
    * A resolving `firegrid.contract.id`: an ACID token (declared in a
    * `*.feature.yaml`) or an existing repo path to the governing
    * ACID/SDD/decision doc. Unresolved ids (incl. `"TODO"`) fail the gate.
    */
-  readonly contractId: string
+  readonly contractId: string;
 }
 
-const ContractAttributes = Symbol.for("firegrid/contract-activity/attributes")
+const ContractAttributes = Symbol.for("firegrid/contract-activity/attributes");
 
 interface ContractCarrier {
-  [ContractAttributes]?: Readonly<Record<string, string>>
+  [ContractAttributes]?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -71,18 +71,18 @@ export const withActivityContract = <A extends Activity.Any>(
   activity: A,
   contract: ActivityContract,
 ): A => {
-  ;(activity as A & ContractCarrier)[ContractAttributes] = {
+  (activity as A & ContractCarrier)[ContractAttributes] = {
     "firegrid.seam.kind": contract.seamKind,
     "firegrid.contract.id": contract.contractId,
-  }
-  return activity
-}
+  };
+  return activity;
+};
 
 /** The contract attributes attached via {@link withActivityContract}, if any. */
 const activityContractAttributes = (
   activity: Activity.Any,
 ): Readonly<Record<string, string>> | undefined =>
-  (activity as Activity.Any & ContractCarrier)[ContractAttributes]
+  (activity as Activity.Any & ContractCarrier)[ContractAttributes];
 
 /**
  * Annotate the CURRENT span with the activity's seam contract, if one was
@@ -90,11 +90,7 @@ const activityContractAttributes = (
  * engine opens its own span, so the current span is the `activity.name` span.
  * A no-op for unannotated activities.
  */
-export const annotateActivityContractSpan = (
-  activity: Activity.Any,
-): Effect.Effect<void> => {
-  const attributes = activityContractAttributes(activity)
-  return attributes === undefined
-    ? Effect.void
-    : Effect.annotateCurrentSpan(attributes)
-}
+export const annotateActivityContractSpan = (activity: Activity.Any): Effect.Effect<void> => {
+  const attributes = activityContractAttributes(activity);
+  return attributes === undefined ? Effect.void : Effect.annotateCurrentSpan(attributes);
+};

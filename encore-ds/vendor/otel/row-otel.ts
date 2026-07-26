@@ -25,8 +25,8 @@
 // "legacy/external producer with no captured trace context" — the consumer
 // starts a new root span, NEVER an error.
 
-import { Effect, Option, Schema } from "effect"
-import * as Tracer from "effect/Tracer"
+import { Effect, Option, Schema } from "effect";
+import * as Tracer from "effect/Tracer";
 
 /**
  * Optional W3C trace context carried on durable rows.
@@ -43,22 +43,21 @@ export const RowOtelContextSchema = Schema.Struct({
   title: "W3C trace context carried on a durable row",
   description:
     "Optional W3C traceparent/tracestate captured at row-append time. Absent on legacy/external rows; consumers start a new root span when missing.",
-})
-export type RowOtelContext = Schema.Schema.Type<typeof RowOtelContextSchema>
+});
+export type RowOtelContext = Schema.Schema.Type<typeof RowOtelContextSchema>;
 
 /** Internal — W3C traceparent: `00-<32hex traceId>-<16hex spanId>-<2hex flags>`. */
-const TRACEPARENT_PATTERN = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/
+const TRACEPARENT_PATTERN = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
 
-const flagsFor = (sampled: boolean): string => (sampled ? "01" : "00")
+const flagsFor = (sampled: boolean): string => (sampled ? "01" : "00");
 
 const encodeTraceparent = (parent: {
-  readonly traceId: string
-  readonly spanId: string
-  readonly sampled: boolean
-}): string => `00-${parent.traceId}-${parent.spanId}-${flagsFor(parent.sampled)}`
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly sampled: boolean;
+}): string => `00-${parent.traceId}-${parent.spanId}-${flagsFor(parent.sampled)}`;
 
-const sampledFromFlags = (flags: string): boolean =>
-  (Number.parseInt(flags, 16) & 0x01) === 0x01
+const sampledFromFlags = (flags: string): boolean => (Number.parseInt(flags, 16) & 0x01) === 0x01;
 
 /**
  * Parse a W3C `traceparent` string. Malformed input ⇒ `Option.none()` — the
@@ -67,21 +66,16 @@ const sampledFromFlags = (flags: string): boolean =>
 export const parseTraceparent = (
   traceparent: string,
 ): Option.Option<{
-  readonly traceId: string
-  readonly spanId: string
-  readonly sampled: boolean
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly sampled: boolean;
 }> => {
   if (!TRACEPARENT_PATTERN.test(traceparent)) {
-    return Option.none()
+    return Option.none();
   }
-  const [, traceId, spanId, flags] = traceparent.split("-") as [
-    string,
-    string,
-    string,
-    string,
-  ]
-  return Option.some({ traceId, spanId, sampled: sampledFromFlags(flags) })
-}
+  const [, traceId, spanId, flags] = traceparent.split("-") as [string, string, string, string];
+  return Option.some({ traceId, spanId, sampled: sampledFromFlags(flags) });
+};
 
 /**
  * Build an `ExternalSpan` from a row that may carry `_otel`. Returns
@@ -90,14 +84,12 @@ export const parseTraceparent = (
  * Accepts both well-typed `{ _otel?: RowOtelContext }` rows and arbitrary
  * `unknown` (the wait router's source row is unknown until decoded).
  */
-export const rowOtelExternalSpan = (
-  row: unknown,
-): Tracer.ExternalSpan | undefined => {
-  if (row === null || typeof row !== "object") return undefined
-  const otel = (row as { _otel?: unknown })._otel
-  if (otel === null || typeof otel !== "object") return undefined
-  const traceparent = (otel as { traceparent?: unknown }).traceparent
-  if (typeof traceparent !== "string") return undefined
+export const rowOtelExternalSpan = (row: unknown): Tracer.ExternalSpan | undefined => {
+  if (row === null || typeof row !== "object") return undefined;
+  const otel = (row as { _otel?: unknown })._otel;
+  if (otel === null || typeof otel !== "object") return undefined;
+  const traceparent = (otel as { traceparent?: unknown }).traceparent;
+  if (typeof traceparent !== "string") return undefined;
   return Option.match(parseTraceparent(traceparent), {
     onNone: () => undefined,
     onSome: (parsed) =>
@@ -106,8 +98,8 @@ export const rowOtelExternalSpan = (
         spanId: parsed.spanId,
         sampled: parsed.sampled,
       }),
-  })
-}
+  });
+};
 
 /**
  * PRODUCER one-liner. Stamp `_otel` onto a row from the current Effect span.
@@ -137,7 +129,7 @@ export const stampRowOtel = <R extends object>(
       },
     })),
     Effect.orElseSucceed(() => row as R & { readonly _otel?: RowOtelContext }),
-  )
+  );
 
 /**
  * CONSUMER one-liner. If `row` carries a parseable `_otel`, set its parent
@@ -155,14 +147,11 @@ export const stampRowOtel = <R extends object>(
  * )
  * ```
  */
-export const withRowOtelParent = (
-  row: unknown,
-) =>
-<A, E, R>(
-  effect: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, Exclude<R, Tracer.ParentSpan>> => {
-  const parent = rowOtelExternalSpan(row)
-  return parent === undefined
-    ? (effect as Effect.Effect<A, E, Exclude<R, Tracer.ParentSpan>>)
-    : Effect.withParentSpan(effect, parent)
-}
+export const withRowOtelParent =
+  (row: unknown) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, Exclude<R, Tracer.ParentSpan>> => {
+    const parent = rowOtelExternalSpan(row);
+    return parent === undefined
+      ? (effect as Effect.Effect<A, E, Exclude<R, Tracer.ParentSpan>>)
+      : Effect.withParentSpan(effect, parent);
+  };
